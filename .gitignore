@@ -34,3 +34,7 @@ node_modules/
 __pycache__/
 .DS_Store
 Thumbs.db
+
+# 临时补丁脚本
+_*.mjs
+_tmp-*
