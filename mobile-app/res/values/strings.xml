@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">抖音4K</string>
+    <string name="loading">正在加载抖音桌面版…</string>
+    <string name="net_error">网络没连上，点屏幕重试</string>
+    <string name="need_webview">这台机器没启用系统 WebView，先装一个「Android System WebView」</string>
+</resources>

@@ -1,0 +1,36 @@
+# ---- 探针/抓包产物（含登录 cookie、Chromium 配置，绝不能入库）----
+mobile-web/probe-output/
+*.cookies.json
+cookies.json
+
+# ---- 真机截图（含个人账号内容）----
+mobile-app/shots/
+
+# ---- 还原点 / 本地备份 ----
+_restore-points/
+*.bak
+*.dypc4k.bak
+
+# ---- 构建产物 ----
+mobile-app/build/
+*.apk
+*.dex
+mobile-app/assets/dy4k.js
+
+# ---- 签名密钥 ----
+keys/
+*.p12
+*.keystore
+*.jks
+
+# ---- 依赖与日志 ----
+node_modules/
+*.log
+*.tmp
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+__pycache__/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,24 @@
+{
+  "name": "dypc4k",
+  "version": "1.0.0",
+  "private": true,
+  "description": "抖音 PC 客户端固定 4K 清晰度注入（payload + CDP injector + preload 补丁）",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node test-payload.mjs",
+    "inject": "node inject.mjs --port 92258",
+    "verify": "node inject.mjs --port 92258 --verify",
+    "mobile:test": "node mobile-web/tools/test-userscript.mjs",
+    "mobile:probe": "node mobile-web/tools/probe-play.mjs --script mobile-web/douyin-4k.user.js",
+    "mobile:gears": "node mobile-web/tools/extract-gears.mjs",
+    "mobile:layout": "node mobile-web/tools/probe-layout.mjs",
+    "mobile:code": "node mobile-web/tools/find-code.mjs",
+    "app:build": "powershell -NoProfile -ExecutionPolicy Bypass -File mobile-app/build.ps1",
+    "app:install": "powershell -NoProfile -ExecutionPolicy Bypass -File mobile-app/build.ps1 -Reinstall",
+    "app:test": "node mobile-app/tools/acceptance.mjs",
+    "app:device": "node mobile-app/tools/device.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
