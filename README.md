@@ -10,10 +10,10 @@
 
 | 端 | 形态 | 效果 |
 |---|---|---|
-| **PC（Windows 客户端）** | 双击即用的补丁包 `抖音4K一键补丁.zip` | 每条视频按**该视频能给的最高档**播放（有 4K 播 4K60，没有就取最高 2K/1080P），不再被自动降档 |
+| **PC（Windows 客户端）** | 双击即用的补丁包 `douyin-4k-patch-v1.5.zip` | 每条视频按**该视频能给的最高档**播放（有 4K 播 4K60，没有就取最高 2K/1080P），不再被自动降档 |
 | **手机（Android）** | `mobile-app` 里的原生壳 App | 抖音网页版 + 原生 4K 播放器（HEVC 硬解），推荐流/主页/评论都有原生实现 |
 
-PC 端补丁的实测证据（统计面板）：`分辨率 3840×2160 / 码流分辨率 3840×2160 / 60fps / adapt_lowest_4_1@-2`。
+PC 端补丁实测：批量 12 条视频，**12/12 达到接口给到的最高分辨率**（含 7 条 3840×2160），`err=0`、`giveup=0`；清晰度标签同步显示「超清 4K」。
 
 ---
 
@@ -28,7 +28,7 @@ pc-oneclick/
 └─ 使用说明.txt
 ```
 
-打包成品：`抖音4K一键补丁.zip`（约 22 KB）。
+打包成品：`douyin-4k-patch-v1.5.zip`。
 
 **原理**：抖音客户端的 `preload.js` 在页面脚本之前执行。补丁在其末尾追加一段脚本，做四件事：
 
@@ -86,14 +86,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\mobile-app\build.ps1
 
 ```
 douyin-4k-mod/
-├─ preload-snippet.js          PC 补丁注入片段（v1.1）
+├─ preload-snippet.js          PC 补丁注入片段（v1.5）
 ├─ install-preload.ps1         开发者安装器（支持探针开关）
 ├─ uninstall-preload.ps1       还原
 ├─ probe-gear.snippet.js       码流档位探针（只读诊断）
 ├─ analyze-gear-log.mjs        分析探针日志
 ├─ test-payload.mjs            注入片段的离线单测
 ├─ pc-oneclick/                面向普通用户的分发目录
-├─ 抖音4K一键补丁.zip            成品
+
 ├─ mobile-web/                 手机网页版用户脚本 + 探针工具
 ├─ mobile-app/                 Android 壳 App
 └─ docs/                       全部文档

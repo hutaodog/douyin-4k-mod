@@ -1,4 +1,3 @@
-# ---- 探针/抓包产物（含登录 cookie、Chromium 配置，绝不能入库）----
 mobile-web/probe-output/
 *.cookies.json
 cookies.json
@@ -38,3 +37,6 @@ Thumbs.db
 # 临时补丁脚本
 _*.mjs
 _tmp-*
+
+# ---- 临时工作目录（探针脚本 / 截图 / asar 转储）----
+/work/
