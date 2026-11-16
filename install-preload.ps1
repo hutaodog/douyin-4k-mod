@@ -36,8 +36,10 @@ param(
   #                   none（不改判）
   [ValidateSet('vvc', 'vvc-all', 'none')]
   [string]$Refuse = 'none',
-  # 关闭"改写服务端 AB 配置里的自动降档开关"。默认开启 —— 这是让 4K 稳定的关键那一步。
+  # 兼容旧版参数；两个 AB 实验均已关闭，原生 ABR/卡顿恢复保持原值。
   [switch]$NoAbPatch,
+  # 关闭起播前的高画质 HEVC 档位组优选，便于对照或回退。
+  [switch]$NoHevcPreference,
   # 允许在抖音运行时写入（改完需要重启抖音才生效；一般不建议）
   [switch]$AllowRunning
 )
@@ -91,7 +93,10 @@ $snippet = $snippet -replace "var TARGET = '[^']+';", "var TARGET = '$Target';"
 $snippet = $snippet -replace "var FIGHT = (true|false);", ("var FIGHT = {0};" -f $(if ($Fight) { 'true' } else { 'false' }))
 $snippet = $snippet -replace "var LOCK_CODEC = '[^']*';", ("var LOCK_CODEC = '{0}';" -f $Codec)
 $snippet = $snippet -replace "var REFUSE = '[^']*';", ("var REFUSE = '{0}';" -f $Refuse)
-$snippet = $snippet -replace "var AB_PATCH = (true|false);", ("var AB_PATCH = {0};" -f $(if ($NoAbPatch) { 'false' } else { 'true' }))
+$snippet = $snippet -replace "var AB_PATCH = (true|false);", 'var AB_PATCH = false;'
+$snippet = $snippet -replace "var QUALITY_AB_PATCH = (true|false);", 'var QUALITY_AB_PATCH = false;'
+$snippet = $snippet -replace "var PREFER_HIGH_HEVC = (true|false);", ("var PREFER_HIGH_HEVC = {0};" -f $(if ($NoHevcPreference) { 'false' } else { 'true' }))
+$snippet = $snippet -replace "var SAFE_PLAYBACK = (true|false);", 'var SAFE_PLAYBACK = true;'
 
 $append = $snippet
 if ($WithQualityProbe) {
@@ -119,14 +124,15 @@ $newContent = $content.TrimEnd() + [Environment]::NewLine + [Environment]::NewLi
 $newMd5 = (Get-FileHash -LiteralPath $Preload -Algorithm MD5).Hash.ToLower()
 Write-Host "[+] 已写入补丁: $Preload" -ForegroundColor Green
 Write-Host "    目标档位 : $Target"
-Write-Host "    抢档策略 : $(if ($Fight) { 'FIGHT —— 抢回 4K + 拦截降档调用（可能偶发重载）' } else { '不抢 —— 起播 4K，被客户端降档后保持稳定' })"
-Write-Host "    编码族   : $(if ($Codec) { "钉住 $Codec" } else { '不钉' })"
-Write-Host "    AB 降档开关: $(if ($NoAbPatch) { '不改写' } else { '改写成 0（auto_clarity_reselect / switch_clarity_timing / smooth_switch_clarity / degradeBitrateFactors 等）' })"
-Write-Host "    编码改判 : $(switch ($Refuse) { 'vvc' { '只封 H.266/VVC（放行 HEVC，4K 可用）' } 'vvc-all' { 'HEVC/VVC/AV1 全封（只剩 H.264，4K 会消失）' } default { '不改判' } })"
+Write-Host "    播放策略 : 保留高画质偏好；不硬换源、不补档抢档、不重置缓冲"
+Write-Host "    起播选档 : $(if ($NoHevcPreference) { '原生选择（HEVC 优选已关闭）' } else { '同视频 HEVC 档位更高且本机支持时，起播前优选；保留低码率档' })"
+Write-Host "    清晰度重选: 原值（两个 AB 改写实验均关闭）"
+Write-Host "    ABR/卡顿恢复: 保留原值"
+Write-Host "    编码改判 : 不改判"
 Write-Host "    质量探针 : $(if ($WithQualityProbe) { '已装 -> %APPDATA%\douyin\dypc4k-quality.log' } else { '未装' })"
 Write-Host "    诊断探针 : $(if ($WithDiag) { '已装 -> %APPDATA%\douyin\dypc4k-diag.log' } else { '未装' })"
 Write-Host "    原始 md5 : $origMd5"
 Write-Host "    当前 md5 : $newMd5"
 Write-Host ""
-Write-Host "下一步：启动抖音，打开推荐页任意视频，清晰度应显示「超清 4K」。"
+Write-Host "下一步：启动抖音，推荐页保留 4K 偏好；实际画质由视频源、客户端和网络决定。Alt+I 可查看实际分辨率。"
 Write-Host "撤销  ： powershell -ExecutionPolicy Bypass -File .\uninstall-preload.ps1"

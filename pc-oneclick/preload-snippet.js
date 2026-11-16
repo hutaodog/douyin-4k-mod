@@ -1,5 +1,10 @@
 /* ==== dypc4k begin ==== */
-/* dypc4k v1.5 —— 变更（核心：真正把视频换到最高档，MSE 也能换）：
+/* dypc4k 稳定性修复（2026-11-15）：
+ * 默认保留 4K 偏好，不改写媒体源、播放进度、编码能力或原生 ABR / 卡顿恢复。
+ * 巡检只读；网络档位采集异步进行；原有视频详情面板和诊断命令保留。
+ * 以下 v1.5 记录描述旧版行为，安全播放模式不执行旧版硬换源、补档和标签改写。
+ */
+/* dypc4k v1.5 —— 历史变更（核心：真正把视频换到最高档，MSE 也能换）：
  *   1) 换源改成"硬换"：清掉 <source> 子元素 -> media.src = 目标档 mp4 直链 -> 恢复播放进度。
  *      原因（反编译 + 实测）：xgplayer 的 src setter 在 MSE 媒体上直接 return，
  *      changeDefinition 走 switchURL 时 Promise 没有 .catch，失败完全静默；
@@ -53,9 +58,15 @@
     //   'vvc-all' 连 HEVC/AV1 一起封 —— 只留 H.264（实测会把 4K 一起封掉，只剩 1080P）
     //   'none'    不改判
     var REFUSE = 'none';
-    // 改写服务端 AB 参数里的降档开关（auto_clarity_reselect / switch_clarity_timing /
-    // smooth_switch_clarity / degradeBitrateFactors / maxDownSwitchLevel 等）
-    var AB_PATCH = true;
+    // 兼容旧版 AB 参数开关；稳定模式不依赖它。
+    var AB_PATCH = false;
+    // 只改自动清晰度重选输入，不改媒体源，也不关闭 rebuffer 降档恢复。
+    var QUALITY_AB_PATCH = false;
+    // Initialization only: prefer a higher HEVC family over a capped VVC family.
+    var PREFER_HIGH_HEVC = true;
+    // Safety gates cover automatic and remote source changes.
+    var SAFE_PLAYBACK = true;
+    var CAPTURE_GEARS = true;
     try {
       var rawCfg = localStorage.getItem('__DYPC4K_CFG__');
       if (rawCfg) {
@@ -176,6 +187,17 @@
       var URI2AID = {};    // 任意一档的 uri -> aweme_id
       var AID2GEARS = {};  // aweme_id -> 该视频全部档位
       window.__dypc4kGearMap = GEARMAP;
+      var gearUris = [], gearAids = [];
+      function appendGear(arr, rec) {
+        var g = rec.g || {}, pa = g.play_addr || {};
+        var key = [pa.uri, g.gear_name, g.format, g.is_h265, g.bit_rate, pa.width, pa.height].join('|');
+        for (var i = 0; i < arr.length; i++) {
+          if (arr[i].key === key) { rec.key = key; arr[i] = rec; return; }
+        }
+        rec.key = key;
+        arr.push(rec);
+        if (arr.length > 128) arr.shift();
+      }
       function tierDef(h) {
         return h >= 2160 ? -2 : h >= 1400 ? -1 : h >= 1000 ? 1 : h >= 700 ? 2 : 3;
       }
@@ -193,18 +215,31 @@
                 var pa = (g && g.play_addr) || {};
                 var uri = String(pa.uri || '');
                 if (!uri) continue;
-                var arr = GEARMAP[uri] || (GEARMAP[uri] = []);
+                if (!Object.prototype.hasOwnProperty.call(GEARMAP, uri)) {
+                  GEARMAP[uri] = [];
+                  gearUris.push(uri);
+                  if (gearUris.length > 1024) { var oldUri = gearUris.shift(); delete GEARMAP[oldUri]; delete URI2AID[oldUri]; }
+                }
+                var arr = GEARMAP[uri];
                 var h = Math.min(pa.width || 0, pa.height || 0) || Math.max(pa.width || 0, pa.height || 0) || 0;
                 var rec = { def: tierDef(h), h: h, g: g };
-                arr.push(rec);
+                appendGear(arr, rec);
                 // 关键：接口的 uri 是"每档一个"，播放器条目的 uri 未必等于它，
                 // 所以再按 aweme_id 建一份索引，用任意一档的 uri 都能反查到整条视频的档位表。
                 try {
                   var aid = String(v.aweme_id || '');
                   if (aid) {
                     URI2AID[uri] = aid;
-                    var bag = AID2GEARS[aid] || (AID2GEARS[aid] = []);
-                    bag.push(rec);
+                    if (!Object.prototype.hasOwnProperty.call(AID2GEARS, aid)) {
+                      AID2GEARS[aid] = [];
+                      gearAids.push(aid);
+                      if (gearAids.length > 96) {
+                        var oldAid = gearAids.shift();
+                        delete AID2GEARS[oldAid];
+                        Object.keys(URI2AID).forEach(function (u) { if (URI2AID[u] === oldAid) delete URI2AID[u]; });
+                      }
+                    }
+                    appendGear(AID2GEARS[aid], rec);
                   }
                 } catch (e0) {}
               }
@@ -246,6 +281,7 @@
 
       // 给某个播放器的列表补上缺失的高档（返回补进来的档位定义值，没补则返回 null）
       function fillMissing(list) {
+        if (CFG.safePlayback) return null;
         try {
           if (!list || !list.length) return null;
           // 用列表里任意一档的 uri 反查 aweme_id，再拿这条视频的全部档位
@@ -292,6 +328,7 @@
       // 结果搜索和分享全挂（视频走 XHR 所以没事）。这里用**被钩过的那个 fetch**
       // 实打实请求一次搜索接口，把结果写进日志，不依赖人工点页面。
       (function fetchSelfTest() {
+        if (CFG.safePlayback) return;
         function run(tag, url) {
           try {
             var f = window.fetch;
@@ -328,7 +365,7 @@
       // TTE_ENV.layoutInitialProps.allAbParams）。在渲染层把响应里这几个开关改掉，
       // 比改本地 SQLite 可靠（那个每次启动都会被重新拉取覆盖）。
       try {
-        if (CFG.abPatch) {
+        if (!CFG.safePlayback && CFG.abPatch) {
           var AB_OFF = ['auto_clarity_reselect', 'switch_clarity_timing', 'smooth_switch_clarity'];
           var stat = { fetch: 0, xhr: 0, changed: 0, keys: [] };
           function markKey(k) { if (stat.keys.length < 24 && stat.keys.indexOf(k) < 0) stat.keys.push(k); }
@@ -462,12 +499,343 @@
         }
       } catch (e) { post('err', 'abpatch: ' + e.message); }
 
+      // Quality-only AB policy. Never changes codec selection, ABR or rebuffer fields.
+      // Patch body readers on AB responses rather than waiting for a clone before fetch resolves.
+      try {
+        if (CFG.qualityAbPatch) {
+          var qaKeys = ['auto_clarity_reselect', 'switch_clarity_timing', 'smooth_switch_clarity'];
+          var qaStat = W.__dypc4kQualityAB = { reads: 0, changed: 0, keys: [] };
+          function qaPatch(value, depth) {
+            if (!value || typeof value !== 'object' || depth > 12) return 0;
+            var changed = 0;
+            Object.keys(value).forEach(function (key) {
+              var item = value[key];
+              if (qaKeys.indexOf(key) >= 0) {
+                var owner = value, prop = key;
+                if (item && typeof item === 'object') {
+                  if (!Object.prototype.hasOwnProperty.call(item, 'val')) return;
+                  owner = item; prop = 'val'; item = item.val;
+                }
+                // Unknown schemas are left intact; do not flatten experiment wrappers.
+                if ((typeof item === 'number' || typeof item === 'boolean' || typeof item === 'string') && Number(item) !== 0 && isFinite(Number(item))) {
+                  owner[prop] = 0; changed++;
+                  if (qaStat.keys.indexOf(key) < 0) qaStat.keys.push(key);
+                }
+              } else if (item && typeof item === 'object') changed += qaPatch(item, depth + 1);
+            });
+            return changed;
+          }
+          function qaTransform(body) {
+            try {
+              var isText = typeof body === 'string';
+              var value = isText ? JSON.parse(body) : body;
+              var n = qaPatch(value, 0);
+              qaStat.reads++; qaStat.changed += n;
+              if (n) post('qualityab', 'changed=' + n + ' [' + qaStat.keys.join(',') + ']');
+              return n && isText ? JSON.stringify(value) : (isText ? body : value);
+            } catch (e) { return body; }
+          }
+          function qaIsURL(input) {
+            try {
+              var url = new URL(String(input || ''), location.href);
+              return /(^|\.)douyin\.com$/i.test(url.hostname) &&
+                /^\/(?:service\/2\/abtest_config|aweme\/v\d+\/web\/mobile\/ab\/params)\/?$/i.test(url.pathname);
+            } catch (e) { return false; }
+          }
+          var qaResponses = new WeakSet();
+          function qaWrapResponse(res) {
+            if (!res || qaResponses.has(res)) return res;
+            qaResponses.add(res);
+            ['json', 'text'].forEach(function (method) {
+              var nativeRead = res[method];
+              if (typeof nativeRead !== 'function') return;
+              try { Object.defineProperty(res, method, { configurable: true, writable: true,
+                value: function () { return nativeRead.apply(this, arguments).then(qaTransform); }
+              }); } catch (e) {}
+            });
+            var nativeClone = res.clone;
+            if (typeof nativeClone === 'function') {
+              try { Object.defineProperty(res, 'clone', { configurable: true, writable: true,
+                value: function () { return qaWrapResponse(nativeClone.apply(this, arguments)); }
+              }); } catch (e) {}
+            }
+            return res;
+          }
+          var qaFetch = W.fetch;
+          if (typeof qaFetch === 'function') {
+            W.fetch = function (input) {
+              var result = qaFetch.apply(this, arguments);
+              var url = typeof input === 'string' || (typeof URL !== 'undefined' && input instanceof URL) ? String(input) : input && input.url;
+              if (qaIsURL(url) && result && typeof result.then === 'function') result.then(qaWrapResponse).catch(function () {});
+              return result;
+            };
+          }
+          var qaXHR = W.XMLHttpRequest;
+          if (qaXHR && qaXHR.prototype) {
+            var qaOpen = qaXHR.prototype.open;
+            qaXHR.prototype.open = function (method, url) {
+              this.__dypc4kQA = qaIsURL(url);
+              this.__dypc4kQACache = null;
+              return qaOpen.apply(this, arguments);
+            };
+            ['responseText', 'response'].forEach(function (property) {
+              var descriptor = Object.getOwnPropertyDescriptor(qaXHR.prototype, property);
+              if (!descriptor || !descriptor.get || descriptor.configurable === false) return;
+              Object.defineProperty(qaXHR.prototype, property, {
+                configurable: true, enumerable: descriptor.enumerable,
+                get: function () {
+                  var body = descriptor.get.call(this);
+                  if (!this.__dypc4kQA || this.readyState !== 4 ||
+                      (this.responseType && this.responseType !== 'text' && this.responseType !== 'json')) return body;
+                  var cached = this.__dypc4kQACache;
+                  if (cached && cached.input === body) return cached.output;
+                  var output = qaTransform(body);
+                  this.__dypc4kQACache = { input: body, output: output };
+                  return output;
+                }
+              });
+            });
+          }
+          var qaLayout = W.TTE_ENV && W.TTE_ENV.layoutInitialProps;
+          if (qaLayout) qaTransform(qaLayout);
+          post('qualityab', 'clarity-only policy installed; codec/ABR/rebuffer unchanged');
+        }
+      } catch (e) { post('err', 'qualityab: ' + e.message); }
+
+      // Choose a complete codec family before native player initialization. Never touch a player/media.
+      // Keep original rows (including all HEVC/AVC recovery rungs); omit VVC only when its own
+      // same-video family is capped below an available, locally supported HEVC family.
+      try {
+        if (CFG.preferHighHevc) {
+          var hiStat = W.__dypc4kHevcInit = { reads: 0, changed: 0, recent: [] };
+          function hiSupported() {
+            try {
+              return Number(navigator.hardwareConcurrency) >= 8 && !!W.MediaSource &&
+                typeof W.MediaSource.isTypeSupported === 'function' &&
+                W.MediaSource.isTypeSupported('video/mp4;codecs=hev1.1.6.L93.B0');
+            } catch (e) { return false; }
+          }
+          function hiVideo(aweme) {
+            var video = aweme && aweme.video, rows = video && video.bit_rate;
+            var aid = aweme && aweme.aweme_id;
+            if (typeof aid !== 'string' || !/^\d{8,30}$/.test(aid) || !Array.isArray(rows) ||
+                !rows.length || rows.length > 128 || aweme.room || aweme.live_room || aweme.is_live ||
+                aweme.room_id || Number(aweme.aweme_type) === 101 || video.is_live || !hiSupported()) return false;
+            var hevc = [], vvc = [], bestH = 0, bestV = 0, bestUri = '', bad = false;
+            rows.forEach(function (row) {
+              if (!row || (row.is_h265 !== 1 && row.is_h265 !== 2)) return;
+              var pa = row.play_addr || {}, urls = pa.url_list;
+              var width = Number(pa.width), height = Number(pa.height), short = Math.min(width, height);
+              var uri = typeof pa.uri === 'string' ? pa.uri : '';
+              // Incomplete/ambiguous codec metadata is not permission to remove a family.
+              if (!uri || !isFinite(short) || short <= 0 || Math.max(width, height) > 16384 ||
+                  !Array.isArray(urls) || !urls.some(function (u) { return typeof u === 'string' && /^https?:\/\//i.test(u); })) {
+                bad = true; return;
+              }
+              if (row.is_h265 === 1) {
+                // HDR/DASH-only high rungs are not a replacement for an SDR progressive family.
+                if (row.format && row.format !== 'mp4') return;
+                if (row.HDR_type || row.HDR_bit) return;
+                // Native normalization drops API-only play addresses; require a direct URL.
+                if (!urls.some(function (u) { return typeof u === 'string' && /^https?:\/\//i.test(u) && !/\/aweme\/v\d+\//i.test(u); })) return;
+                hevc.push({ row: row, short: short, uri: uri });
+                if (short > bestH) { bestH = short; bestUri = uri; }
+              } else { vvc.push({ row: row, short: short, uri: uri }); bestV = Math.max(bestV, short); }
+            });
+            if (bad || !hevc.length || !vvc.length || bestH <= 1080 || bestH <= bestV) return false;
+            // Exact URI alignment avoids borrowing another video's high rung from a mixed payload.
+            if (hevc.some(function (r) { return r.uri !== bestUri; }) ||
+                vvc.some(function (r) { return r.uri !== bestUri; })) return false;
+            var primary = video.play_addr && video.play_addr.uri;
+            if (primary && primary !== bestUri) return false;
+            var kept = rows.filter(function (row) { return !row || row.is_h265 !== 2; });
+            if (kept.length === rows.length) return false;
+            captureGears(aweme); // Retain original API maxima for same-video verification.
+            video.bit_rate = kept;
+            hiStat.changed++;
+            hiStat.recent.push({ aid: aid, uri: bestUri, hevc: bestH, vvc: bestV, kept: kept.length, removed: rows.length - kept.length });
+            if (hiStat.recent.length > 24) hiStat.recent.shift();
+            post('hevcinit', 'aid=' + aid + ' hevc=' + bestH + ' vvc=' + bestV + ' kept=' + kept.length);
+            return true;
+          }
+          function hiTransform(body) {
+            try {
+              var text = typeof body === 'string', value = text ? JSON.parse(body) : body;
+              if (!value || typeof value !== 'object') return body;
+              var stack = [value], seen = new WeakSet(), changed = false, budget = 4000;
+              hiStat.reads++;
+              while (stack.length && budget-- > 0) {
+                var node = stack.pop();
+                if (!node || typeof node !== 'object' || seen.has(node)) continue;
+                seen.add(node);
+                if (node.video && Array.isArray(node.video.bit_rate)) changed = hiVideo(node) || changed;
+                Object.keys(node).forEach(function (key) {
+                  // Raw aweme objects own their video. Do not traverse into media/DOM/player graphs.
+                  var child = node[key];
+                  if (child && typeof child === 'object' && key !== 'bit_rate') stack.push(child);
+                });
+              }
+              return text && changed ? JSON.stringify(value) : body;
+            } catch (e) { return body; }
+          }
+          function hiIsURL(input) {
+            try {
+              var url = new URL(String(input || ''), location.href);
+              return /(^|\.)douyin\.com$/i.test(url.hostname) &&
+                /^\/aweme\/v\d+\/(?:web\/(?:aweme\/(?:detail|post|favorite|related)|feed|tab\/feed|familiar\/feed|mix\/aweme)|feed|aweme\/detail)\/?$/i.test(url.pathname);
+            } catch (e) { return false; }
+          }
+          var hiResponses = new WeakSet();
+          function hiWrapResponse(response) {
+            if (!response || hiResponses.has(response)) return response;
+            hiResponses.add(response);
+            ['text', 'json'].forEach(function (method) {
+              var nativeRead = response[method];
+              if (typeof nativeRead !== 'function') return;
+              try { Object.defineProperty(response, method, { configurable: true, writable: true,
+                value: function () { return nativeRead.apply(this, arguments).then(hiTransform); }
+              }); } catch (e) {}
+            });
+            // Caller clones get the same policy; passive capture uses its unwrapped raw clone.
+            var nativeClone = response.clone;
+            if (typeof nativeClone === 'function') {
+              try { Object.defineProperty(response, '__dypc4kRawClone', { configurable: true, value: nativeClone }); } catch (e) {}
+              try { Object.defineProperty(response, 'clone', { configurable: true, writable: true,
+                value: function () { return hiWrapResponse(nativeClone.apply(this, arguments)); }
+              }); } catch (e) {}
+            }
+            return response;
+          }
+          var hiFetch = W.fetch;
+          if (typeof hiFetch === 'function') {
+            W.fetch = function (input) {
+              var result = hiFetch.apply(this, arguments);
+              var url = typeof input === 'string' || (typeof URL !== 'undefined' && input instanceof URL) ? String(input) : input && input.url;
+              if (hiIsURL(url) && result && typeof result.then === 'function') result.then(hiWrapResponse).catch(function () {});
+              return result;
+            };
+          }
+          var hiXHR = W.XMLHttpRequest;
+          if (hiXHR && hiXHR.prototype) {
+            var hiOpen = hiXHR.prototype.open;
+            hiXHR.prototype.open = function (method, url) {
+              this.__dypc4kHi = hiIsURL(url); this.__dypc4kHiMemo = null;
+              return hiOpen.apply(this, arguments);
+            };
+            ['responseText', 'response'].forEach(function (property) {
+              var descriptor = Object.getOwnPropertyDescriptor(hiXHR.prototype, property);
+              if (!descriptor || !descriptor.get || descriptor.configurable === false) return;
+              Object.defineProperty(hiXHR.prototype, property, { configurable: true, enumerable: descriptor.enumerable,
+                get: function () {
+                  var body = descriptor.get.call(this);
+                  if (!this.__dypc4kHi || this.readyState !== 4 ||
+                      (this.responseType && this.responseType !== 'text' && this.responseType !== 'json')) return body;
+                  var memo = this.__dypc4kHiMemo;
+                  if (memo && memo.input === body) return memo.output;
+                  var output = hiTransform(body); this.__dypc4kHiMemo = { input: body, output: output };
+                  return output;
+                }
+              });
+            });
+          }
+          // Apply initial server data when present, and intercept its first assignment before app normalization.
+          var hiEnv = W.TTE_ENV;
+          function hiHookLayout(env) {
+            if (!env || typeof env !== 'object') return;
+            var descriptor = Object.getOwnPropertyDescriptor(env, 'layoutInitialProps');
+            if (descriptor && (!descriptor.configurable || descriptor.get || descriptor.set || descriptor.writable === false)) {
+              if (env.layoutInitialProps) hiTransform(env.layoutInitialProps); return;
+            }
+            var layout = env.layoutInitialProps;
+            if (layout) hiTransform(layout);
+            Object.defineProperty(env, 'layoutInitialProps', { configurable: true, enumerable: true,
+              get: function () { return layout; }, set: function (value) { layout = hiTransform(value); }
+            });
+          }
+          var hiEnvDescriptor = Object.getOwnPropertyDescriptor(W, 'TTE_ENV');
+          if (!hiEnvDescriptor || (hiEnvDescriptor.configurable && !hiEnvDescriptor.get && !hiEnvDescriptor.set && hiEnvDescriptor.writable !== false)) {
+            if (hiEnv) hiHookLayout(hiEnv);
+            Object.defineProperty(W, 'TTE_ENV', { configurable: true, enumerable: true,
+              get: function () { return hiEnv; }, set: function (value) { hiEnv = value; hiHookLayout(value); }
+            });
+          } else if (hiEnv) hiHookLayout(hiEnv);
+          post('hevcinit', 'response-only initialization policy installed');
+        }
+      } catch (e) { post('err', 'hevcinit: ' + e.message); }
+
+      // Passive gear capture is independent from AB response rewriting.
+      try {
+        if (CFG.captureGears) {
+          // Capture JSON API metadata, never clone media from /aweme/v1/play/.
+          var CG_URL = /\/aweme\/v\d+\/(?:web\/|feed\/|aweme\/)/i;
+          var cgFetch = W.fetch;
+          if (typeof cgFetch === 'function' && !cgFetch.__dypc4kCapture) {
+            var wrappedFetch = function () {
+              var url = '';
+              try { url = String(typeof arguments[0] === 'string' ? arguments[0] : arguments[0] && arguments[0].url || ''); } catch (e) {}
+              var result = cgFetch.apply(this, arguments);
+              if (CG_URL.test(url) && result && typeof result.then === 'function') {
+                result.then(function (res) {
+                  try { (res.__dypc4kRawClone ? res.__dypc4kRawClone.call(res) : res.clone()).text().then(function (txt) {
+                    if (txt.indexOf('bit_rate') < 0) return;
+                    try { captureGears(JSON.parse(txt)); } catch (e) {}
+                  }).catch(function () {}); } catch (e) {}
+                }).catch(function () {});
+              }
+              return result;
+            };
+            wrappedFetch.__dypc4kCapture = 1;
+            W.fetch = wrappedFetch;
+          }
+          var CG_XHR = W.XMLHttpRequest;
+          if (CG_XHR && CG_XHR.prototype && !CG_XHR.prototype.__dypc4kCapture) {
+            var cgOpen = CG_XHR.prototype.open;
+            CG_XHR.prototype.open = function (method, url) {
+              if (this.__dypc4kCaptureLoad) {
+                this.removeEventListener('load', this.__dypc4kCaptureLoad);
+                this.__dypc4kCaptureLoad = null;
+              }
+              this.__dypc4kCaptureUrl = String(url || '');
+              return cgOpen.apply(this, arguments);
+            };
+            var cgSend = CG_XHR.prototype.send;
+            CG_XHR.prototype.send = function () {
+              var xhr = this;
+              if (CG_URL.test(xhr.__dypc4kCaptureUrl || '') && !xhr.__dypc4kCaptureLoad) {
+                var onLoad = function () {
+                  xhr.removeEventListener('load', onLoad);
+                  xhr.__dypc4kCaptureLoad = null;
+                  try {
+                    var body = xhr.responseType === 'json' ? xhr.response :
+                      (!xhr.responseType || xhr.responseType === 'text') ? xhr.responseText : null;
+                    if (!body || (typeof body === 'string' && body.indexOf('bit_rate') < 0)) return;
+                    setTimeout(function () {
+                      try { captureGears(typeof body === 'string' ? JSON.parse(body) : body); } catch (e) {}
+                    }, 0);
+                  } catch (e) {}
+                };
+                xhr.__dypc4kCaptureLoad = onLoad;
+                xhr.addEventListener('load', onLoad, { once: true });
+              }
+              try { return cgSend.apply(xhr, arguments); }
+              catch (err) {
+                if (xhr.__dypc4kCaptureLoad) xhr.removeEventListener('load', xhr.__dypc4kCaptureLoad);
+                xhr.__dypc4kCaptureLoad = null;
+                throw err;
+              }
+            };
+            CG_XHR.prototype.__dypc4kCapture = 1;
+          }
+          post('gear', 'passive asynchronous capture installed');
+        }
+      } catch (e) { post('err', 'gear capture: ' + e.message); }
+
       // ---------- 0) 改判定输入：按 REFUSE 范围封掉某些编码族的"支持检测" ----------
       // 客户端的 nH/nU/nD 三条分支出自 isTypeSupported / canPlayType / mediaCapabilities。
       // 实测：HEVC 就是 4K 所在的那一族；VVC(H.266) 那一族没有 4K。
       // 所以只封 VVC，能挡住客户端 8 秒后迁过去，又不会把 4K 一起封掉。
       try {
-        if (CFG.refuse && CFG.refuse !== 'none') {
+        if (!CFG.safePlayback && CFG.refuse && CFG.refuse !== 'none') {
           var HARD = CFG.refuse === 'vvc-all'
             ? /(hvc1|hev1|dvh1|dvhe|vvc1|vvi1|h266|av01)/i
             : /(vvc1|vvi1|h266|vvcC)/i;
@@ -624,7 +992,25 @@
       }
 
       var reverts = {}, lastSig = '', tickCount = 0, cached = [], QLOG_SEEN = {};
-      var good4k = {}, reinjected = {}, goodCodec = {};   // 缓存 4K 项 / 塞回次数 / 4K 时的编码族
+      // 【v1.6】缓存按"这条视频"而不是"这个播放器"存。
+      // 之前用 good4k[idx]（idx 是播放器序号，切视频时不变），切到下一条视频时
+      // 会把上一条的 4K 条目当成"这条视频也有 4K"塞回去 —— 轻则换源到别的视频，
+      // 重则 uri 不匹配直接失败。现在用 uri 前缀当 key，切视频自然失效。
+      var good4k = {}, reinjected = {}, goodCodec = {}, reinjectAt = {};
+      function vidKey(p, list) {
+        try {
+          var l = list || defList(p);
+          for (var i = 0; i < (l ? l.length : 0); i++) {
+            var u = l[i] && l[i].uri;
+            if (!u) continue;
+            // 每档 uri 不同，但都能反查回同一个 aweme_id；用 aweme_id 当 key 最稳，
+            // 客户端重建 definition.list、顺序变了也不会失效。
+            if (URI2AID[u]) return 'a' + URI2AID[u];
+            return String(u);
+          }
+        } catch (e) {}
+        return '';
+      }
 
       function defList(p) {
         try {
@@ -663,7 +1049,7 @@
       //   _attachSourceEvents 先 removeAttribute("src")+load()，之后才 appendChild(<source>)，
       //   canplay 早在 3ms 内就对着旧流触发 -> Promise resolve 但流没换。
       // 所以：把 entry.url 归一成字符串，走 media.src 那条真正换流的路。
-      // 另一个坑：<source> 子元素存在时浏览器会忽略 media.src（HTML 规范），必须先清干净。
+      // 浏览器优先使用 srcObject，其次是 src 属性，最后才是 <source>；安全模式不更改它们。
       // 【v1.5 bugfix】实测出现过 entry.url === 5（数字）导致 forceChange 把 media.src
       // 设成 "5" 的情况：换流静默失败，而 <video> 还停在旧流上，看起来像"钉了没反应"。
       // 所以这里改成：把所有可能的取址位置都试一遍，并且只接受 http(s) 开头的串。
@@ -692,6 +1078,38 @@
         }
         return '';
       }
+      // 【v1.7】有些播放器（dash 系）把档位条目存成 {uri,v vid,url:"7"} 这种形状，
+      // url 只是个序号字符串。用 uri/vid 反查接口档位缓存，拿真正的直链。
+      function urlFromGearMap(entry) {
+        try {
+          var gm = W.__dypc4kGearMap || {};
+          var keys = [];
+          try { if (entry && entry.uri) keys.push(String(entry.uri)); } catch (a0) {}
+          try { if (entry && entry.vid) keys.push(String(entry.vid)); } catch (a1) {}
+          var want = entry && entry.definition;
+          for (var i = 0; i < keys.length; i++) {
+            var arr = gm[keys[i]];
+            if (!arr || !arr.length) continue;
+            var pick = null;
+            for (var j = 0; j < arr.length; j++) {
+              if (want !== undefined && Number(arr[j].def) === Number(want)) { pick = arr[j]; break; }
+            }
+            if (!pick) {
+              for (var k = 0; k < arr.length; k++) {
+                if (!pick || Number(arr[k].def) < Number(pick.def)) pick = arr[k];
+              }
+            }
+            if (!pick || !pick.g) continue;
+            var pa = pick.g.play_addr || pick.g.play_addr_265 || {};
+            var ul = pa.url_list || [];
+            for (var m = 0; m < ul.length; m++) {
+              if (httpish(ul[m])) return String(ul[m]);
+            }
+          }
+        } catch (e) {}
+        return '';
+      }
+
       function urlOf(entry) {
         try {
           if (!entry) return '';
@@ -722,11 +1140,51 @@
         } catch (e) { return ''; }
       }
 
+      // 同一个档位通常有 3 个 CDN 镜像，某个拉不起来时换下一个
+      function urlOfAll(entry) {
+        var out = [], seen = {};
+        function push(v) {
+          var s = httpish(v);
+          if (s && !seen[s]) { seen[s] = 1; out.push(s); }
+        }
+        function walk(v, depth) {
+          if (depth > 4 || v === null || v === undefined) return;
+          var t = Object.prototype.toString.call(v);
+          if (t === '[object String]') { push(v); return; }
+          if (t === '[object Array]') { for (var i = 0; i < v.length; i++) walk(v[i], depth + 1); return; }
+          if (t === '[object Object]') {
+            var ks = ['src', 'url', 'Src', 'Url', 'playUrl', 'play_url'];
+            for (var j = 0; j < ks.length; j++) if (v[ks[j]] !== undefined) walk(v[ks[j]], depth + 1);
+          }
+        }
+        try {
+          var e = entry || {};
+          var fs2 = ['url', 'urlList', 'url_list', 'playUrl', 'play_url', 'playAddr', 'play_addr'];
+          for (var k = 0; k < fs2.length; k++) if (e[fs2[k]] !== undefined) walk(e[fs2[k]], 0);
+          if (e.url_list) walk(e.url_list, 0);
+        } catch (e2) {}
+        if (!out.length) { var one = urlOf(entry); if (one) out.push(one); }
+        return out;
+      }
+
       function forceChange(p, entry, def) {
+        if (CFG.safePlayback) return false;
         try {
           var m = p.media || p.video;
           if (!m) { post('err', 'force: no media'); return false; }
-          var url = urlOf(entry);
+          var urlsAll = urlOfAll(entry);
+          if (!urlsAll.length) {
+            var gmUrl = urlFromGearMap(entry);
+            if (gmUrl) { urlsAll = [gmUrl]; post('force', 'urlFromGearMap def=' + def + ' len=' + gmUrl.length); }
+          }
+          var url = urlsAll[0] || '';
+          try {
+            var fails = W.__dypc4kFailUrl || {};
+            for (var ui = 0; ui < urlsAll.length; ui++) {
+              if (!fails[urlsAll[ui]]) { url = urlsAll[ui]; break; }
+            }
+          } catch (eU) {}
+          var urlCurrent = url;
           if (!url) {
             post('err', 'force: no http url def=' + def + ' urlType=' + Object.prototype.toString.call(entry && entry.url));
             return false;
@@ -737,7 +1195,7 @@
           // 计时挂在 media 元素上（不是播放器上）：多个播放器实例可能共用同一个 <video>。
           var lastAt = m.__dypc4kForceAt || 0;
           var lastIn = m.__dypc4kForceSrc || '';
-          var cooldown = lastIn === url ? 8000 : 2500;
+          var cooldown = lastIn === url ? 3000 : 1800;   // 【v1.6】8s/2.5s 太长，失败后要等很久才能重试
           if (lastAt && (Date.now() - lastAt) < cooldown) {
             post('force', 'skip def=' + def + ' (cooldown ' + (Date.now() - lastAt) + 'ms src=' + (lastIn === url ? 'same' : 'diff') + ')');
             return true;
@@ -753,11 +1211,27 @@
           var before = (m.videoWidth || 0) + 'x' + (m.videoHeight || 0);
           var keepAt = 0, wasPlaying = false;
           try { keepAt = m.currentTime || 0; wasPlaying = !m.paused && !m.ended; } catch (e5) {}
+          // 【v1.6】换源前的完整快照：新流起不来时要能原样退回去，
+          // 否则 <video> 会停在 0x0，用户看到的是"卡死/变糊"，比原来还糟。
+          var prevSrcAttr = '';
+          var prevKids = [];
+          try { prevSrcAttr = m.getAttribute('src') || ''; } catch (g0) {}
+          try {
+            var kk0 = m.querySelectorAll('source');
+            for (var q0 = 0; q0 < kk0.length; q0++) prevKids.push({ src: kk0[q0].getAttribute('src') || '', type: kk0[q0].getAttribute('type') || '' });
+          } catch (g1) {}
           var removed = 0;
           try {
             var kids = m.querySelectorAll('source');
             for (var i = kids.length - 1; i >= 0; i--) { kids[i].parentNode.removeChild(kids[i]); removed++; }
           } catch (e2) {}
+          // 【v1.7 决定性】推荐页的 <video> 上挂着 srcObject = MediaStream，
+          // 只要 srcObject 非空，浏览器就完全忽略 src 属性 —— 此时 setAttribute('src')+load()
+          // 表面上"换了"，实际 currentSrc 恒为空、videoWidth 一直回落到旧值。
+          // 实测：清掉 srcObject 后 540x960 -> 2560x1440 立刻生效。
+          var prevSO = null, hadSO = false;
+          try { prevSO = m.srcObject || null; hadSO = !!prevSO; } catch (h0) {}
+          try { m.srcObject = null; } catch (h1) { post('err', 'soNull: ' + h1.message); }
           try { m.pause(); } catch (e4) {}
           // 静默期：换源后 <video> 会短暂回到 0x0 / readyState=0，
           // 这段时间内 step() 不要判定"没到位"，否则会连续 revert + 打满 giveup。
@@ -772,16 +1246,50 @@
             } catch (e7) {}
           }
           try { var pr = m.play(); if (pr && pr.catch) pr.catch(function () {}); } catch (e3) {}
-          post('force', (mse ? 'MSE->mp4 ' : '') + 'def=' + def + ' src=<' + url.length + 'B ' + url.slice(0, 46) + '> before=' + before + ' removedSource=' + removed + ' keep=' + keepAt.toFixed(1) + 's');
-          (function (mm, dd, bb, pp, ee) {
+          post('force', (mse ? 'MSE->mp4 ' : '') + 'def=' + def + ' src=<' + url.length + 'B ' + url.slice(0, 46) + '> before=' + before + ' removedSource=' + removed + ' srcObject=' + (hadSO ? 'cleared' : 'none') + ' keep=' + keepAt.toFixed(1) + 's');
+          (function (mm, dd, bb, pp, ee, oldSrc, oldKids, keepT, wantPlay, oldSO) {
             setTimeout(function () {
               try {
-                post('force', 'after1.5s def=' + dd + ' now=' + (mm.videoWidth || 0) + 'x' + (mm.videoHeight || 0) + ' was=' + bb + ' rs=' + mm.readyState);
-                // 换流真正落地后再同步标签（太早同步会被客户端按旧流改回去）
-                if ((mm.videoHeight || 0) > 0) syncLabel(pp, ee, dd);
+                var ok = (mm.videoWidth || 0) > 0;
+                post('force', 'after1.5s def=' + dd + ' now=' + (mm.videoWidth || 0) + 'x' + (mm.videoHeight || 0) + ' was=' + bb + ' rs=' + mm.readyState + ' cur=' + (mm.currentSrc ? 'set' : 'EMPTY') + (ok ? '' : ' FAILED'));
+                if (ok) {
+                  // 换流真正落地后再同步标签（太早同步会被客户端按旧流改回去）
+                  syncLabel(pp, ee, dd);
+                  return;
+                }
+                // 【v1.6】新流没起来：把旧源原样装回去，绝不让画面停在 0x0。
+                try { while (mm.firstChild) mm.removeChild(mm.firstChild); } catch (r0) {}
+                try {
+                  if (oldKids && oldKids.length) {
+                    for (var z = 0; z < oldKids.length; z++) {
+                      var sEl = document.createElement('source');
+                      sEl.setAttribute('src', oldKids[z].src);
+                      if (oldKids[z].type) sEl.setAttribute('type', oldKids[z].type);
+                      mm.appendChild(sEl);
+                    }
+                    mm.load();
+                  } else if (oldSrc) {
+                    mm.setAttribute('src', oldSrc);
+                    mm.load();
+                  }
+                  if (oldSO) { try { mm.srcObject = oldSO; post('restore', 'srcObject back'); } catch (r1b) {} }
+                } catch (r1) { post('err', 'restore: ' + r1.message); }
+                if (keepT > 0.35) {
+                  try {
+                    mm.addEventListener('loadedmetadata', function once2() {
+                      mm.removeEventListener('loadedmetadata', once2);
+                      try { mm.currentTime = keepT; } catch (r2) {}
+                    });
+                  } catch (r3) {}
+                }
+                try { if (wantPlay) { var pr2 = mm.play(); if (pr2 && pr2.catch) pr2.catch(function () {}); } } catch (r4) {}
+                // 记下这个档位的失败次数，下次优先换镜像
+                W.__dypc4kFailUrl = W.__dypc4kFailUrl || {};
+                W.__dypc4kFailUrl[urlCurrent] = (W.__dypc4kFailUrl[urlCurrent] || 0) + 1;
+                post('restore', 'def=' + dd + ' back to ' + (oldKids && oldKids.length ? ('<source>x' + oldKids.length) : (oldSrc ? oldSrc.slice(0, 28) : 'nothing')));
               } catch (e) {}
-            }, 1500);
-          })(m, def, before, p, entry);
+            }, 2600);
+          })(m, def, before, p, entry, prevSrcAttr, prevKids, keepAt, wasPlaying, prevSO);
           return true;
         } catch (e) { post('err', 'force: ' + e.message); return false; }
       }
@@ -799,6 +1307,7 @@
       // 做法：换流到位后把 curDefinition 写回目标档，再让客户端自己重算标签。不改 DOM。
       var LABEL_MAP = { '-2': '超清 4K', '-1': '超清 2K', '1': '高清 1080P', '2': '高清 720P', '3': '标清 540P', '4': '极速', '0': '智能' };
       function syncLabel(p, entry, def) {
+        if (CFG.safePlayback) return;
         try {
           if (!p || !entry) return;
           var d = Number(def);
@@ -863,6 +1372,7 @@
       // 因为控件隐藏时尺寸恒为 0 —— 这就是 labelFix 一直不生效的真因。
       var DOM_LABEL_TXT = { '-2': '超清 4K', '-1': '超清 2K', '1': '高清 1080P', '2': '高清 720P', '3': '标清 540P', '4': '极速', '0': '智能' };
       function labelDom() {
+        if (CFG.safePlayback) return;
         try {
           var ps = allPlayers(), best = null, bestA = -1;
           for (var i = 0; i < ps.length; i++) {
@@ -899,6 +1409,7 @@
 // 拦截"降档"：客户端换族后会调用 changeDefinition 切到更低档（1/2/3 或 -1），
       // 只要 4K 可用（列表里有或我们缓存过），就把这类调用吞掉，让播放器保持 4K 流不动。
       function installGuard(p, idx) {
+        if (CFG.safePlayback) return;
         try {
           if (p.__dypc4kGuard) return;
           if (typeof p.changeDefinition !== 'function') return;
@@ -909,10 +1420,11 @@
                 var want = null;
                 if (entry && entry.definition !== undefined) want = Number(entry.definition);
                 else if (typeof entry === 'number') want = Number(entry);
-                var have4k = !!good4k[idx];
+                var l = defList(p);
+                var have4k = !!(l && entryIn(l, CFG.gear));
                 if (!have4k) {
-                  var l = defList(p);
-                  have4k = !!(l && entryIn(l, CFG.gear));
+                  var vk2 = vidKey(p, l);
+                  have4k = !!(vk2 && good4k[vk2]);
                 }
                 if (want !== null && want !== Number(CFG.gear) && have4k) {
                   post('block', 'blocked downgrade -> ' + want);
@@ -933,6 +1445,20 @@
         var ps = cached;
         var dump = [];
         ps.forEach(function (p, idx) {
+          // 【v1.6】每个播放器独立 try/catch。以前任何一个播放器抛异常都会冒泡出
+          // forEach，导致整轮 step() 中断 —— 表现为"某一条视频开始之后就再也不换源了"。
+          try {
+          stepOne(p, idx);
+          } catch (eS) {
+            try {
+              if (!W.__dypc4kStepErr || Date.now() - W.__dypc4kStepErr > 3000) {
+                W.__dypc4kStepErr = Date.now();
+                post('err', 'step#' + idx + ': ' + (eS && eS.message));
+              }
+            } catch (eS2) {}
+          }
+        });
+        function stepOne(p, idx) {
           var cur = curDef(p);
           var c = p.config || {};
           var info = {
@@ -944,25 +1470,29 @@
 
           // 诊断：每条视频首次见到时 dump 一次播放器真实结构
           try {
-            if (info.playing && info.gears && info.gears.length) {
+            if (!CFG.safePlayback && info.playing && info.gears && info.gears.length) {
               var dk = info.gears.join(',') + '|' + cur;
               if (W.__dypc4kDiagOn && !DIAG2_SEEN[dk]) { DIAG2_SEEN[dk] = 1; setTimeout(diag2, 1200); }
             }
           } catch (e0) {}
 
           if (!info.playing) return;
+          // Native playback stays in charge; safe diagnostics use ACT.observe on the exact media.
+          if (CFG.safePlayback) return;
           installGuard(p, idx);                     // 拦住降档调用
-          // 1) 关掉自动码率（ABR 会按缓冲/带宽自己上下调档）
+          // Safe mode leaves native ABR and rebuffer recovery untouched.
+          if (!CFG.safePlayback) {
+            try {
+              if (c.needAutoBitrate !== false) {
+                c.needAutoBitrate = false;
+                c.autoBitrateOpts = { isPlayAutoDefi: false, isOpenAutoDefi: false };
+                post('lock', 'needAutoBitrate=false, autoBitrateOpts=off');
+              }
+            } catch (e) {}
+          }
+          // Codec pinning is disabled in safe mode.
           try {
-            if (c.needAutoBitrate !== false) {
-              c.needAutoBitrate = false;
-              c.autoBitrateOpts = { isPlayAutoDefi: false, isOpenAutoDefi: false };
-              post('lock', 'needAutoBitrate=false, autoBitrateOpts=off');
-            }
-          } catch (e) {}
-          // 1.5) 钉住编码族：4K 只存在于原来那一族里
-          try {
-            if (CFG.codec && c.codecType !== CFG.codec) {
+            if (!CFG.safePlayback && CFG.codec && c.codecType !== CFG.codec) {
               var prev = String(c.codecType);
               c.codecType = CFG.codec;
               if (!p.__dypc4kCodecLogged || Date.now() - p.__dypc4kCodecLogged > 5000) {
@@ -992,22 +1522,32 @@
             if (bestE) { effTgt = bestE; effDef = Number(bestE.definition); }
           }
 
-          if (tgt) {
-            good4k[idx] = tgt;                          // 见到就缓存一份
+          var vk = vidKey(p, list);
+          if (tgt && vk) {
+            good4k[vk] = tgt;                           // 见到就缓存一份（按视频 uri）
+            if (reinjected[vk]) { reinjected[vk] = 0; reinjectAt[vk] = 0; }
             if (c.codecType !== undefined || c.initCodecType !== undefined) {
-              goodCodec[idx] = { codecType: c.codecType, initCodecType: c.initCodecType };
+              goodCodec[vk] = { codecType: c.codecType, initCodecType: c.initCodecType };
             }
           }
 
           // 2) 列表被客户端整体重建、4K 项被抽走
-          if (!tgt && good4k[idx]) {
-            post('lost4k', 'client dropped 4K from list (FIGHT=' + FIGHT + ')');
-            if (!FIGHT) return;                        // 不拉锯：交给客户端
-            var n = reinjected[idx] || 0;
-            if (n >= 8) return;
-            reinjected[idx] = n + 1;
+          if (!CFG.safePlayback && !tgt && vk && good4k[vk]) {
+            // 【v1.6】原来这里判断 FIGHT —— 但 FIGHT 是 preload 侧的变量，
+            // LOCK_FN 是 toString() 注入主世界的，闭包丢了，于是每次走到这里就抛
+            // ReferenceError: FIGHT is not defined，step() 整条链断掉：
+            // 客户端降档 / 重建 definition.list 抽走 4K 的那一刻，补丁从此不再工作，
+            // 视频就永久停在 540P/720P。这就是"刷着刷着变糊"的真因。
+            var n = reinjected[vk] || 0;
+            // 【v1.6】原来"每视频最多 8 次"是硬上限、永不清零，播久了必然打满 ->
+            // 这条视频之后再也补不回 4K。改成限频 + 高上限，并在看到 4K 回来时重置。
+            var lastRe = reinjectAt[vk] || 0;
+            if (n >= 60) return;
+            if (lastRe && Date.now() - lastRe < 2500) return;
+            reinjectAt[vk] = Date.now();
+            reinjected[vk] = n + 1;
             try {
-              var gc = goodCodec[idx];
+              var gc = goodCodec[vk];
               if (gc) {
                 var prevCodec = String(c.codecType);
                 if (gc.codecType !== undefined && c.codecType !== gc.codecType) {
@@ -1018,11 +1558,17 @@
                   c.initCodecType = gc.initCodecType;
                 }
               }
-              list.push(good4k[idx]);
+              var g4 = good4k[vk];
+              // 这条视频的缓存条目必须真的属于它（uri 对得上），否则别塞
+              var own = false;
+              for (var gi2 = 0; gi2 < list.length; gi2++) {
+                if (list[gi2] && String(list[gi2].uri) === String(g4 && g4.uri)) { own = true; break; }
+              }
+              list.push(g4);
               p.config.definition.list = list;
-              post('reinject', 'list lost 4K -> re-inserted (#' + (n + 1) + ')');
-              if (!forceChange(p, good4k[idx], Number(good4k[idx].definition))) {
-                p.changeDefinition(good4k[idx], p.curDefinition);
+              post('reinject', 'list lost 4K -> re-inserted (#' + (n + 1) + ') sameUri=' + own);
+              if (!forceChange(p, g4, Number(g4.definition))) {
+                p.changeDefinition(g4, p.curDefinition);
               }
             } catch (e) { post('err', 'reinject: ' + e.message); }
             return;
@@ -1121,6 +1667,9 @@
             }
           } catch (e7) {}
 
+          // Safe mode is observational: no synthetic ladder entries or quality corrections.
+          if (CFG.safePlayback) return;
+
           // 2.5) 播放器列表缺高档？用接口档位补进来，并把目标改成补进来的那一档
           try {
             var filled = fillMissing(list);
@@ -1160,6 +1709,12 @@
               post('at', 'def=' + effDef + ' real=' + realW + 'x' + realH + ' ok');
             }
             try { var mp2 = p.video || p.media; if (mp2) mp2.__dypc4kForcePendingUntil = 0; } catch (eP2) {}
+            // 已经到位：清掉这条流的退避记录，下次再被降档时能立刻拉回
+            try {
+              var cs0 = String((p.video && p.video.currentSrc) || '');
+              var bk = W.__dypc4kBackoff || {};
+              for (var kk in bk) { if (kk.indexOf(cs0 + '|') === 0) { delete bk[kk]; reverts[kk] = 0; } }
+            } catch (eBk) {}
             syncLabel(p, effTgt, effDef);
             if (!W.__dypc4kLdomAt || Date.now() - W.__dypc4kLdomAt > 1200) { W.__dypc4kLdomAt = Date.now(); labelDom(); }
             return;
@@ -1167,18 +1722,25 @@
           var vkey;
           try { vkey = (p.video && p.video.currentSrc) || ('i' + idx); } catch (e) { vkey = 'i' + idx; }
           vkey = (vkey + '|' + effDef);
+          // 【v1.6】退避而不是永久放弃。原来累计 5 次就 return 且永不清零，
+          // MSE 下 currentSrc 恒为同一个 blob:，计数只增不减 —— 播久了一定打满，
+          // 之后这条视频就再也拉不回高画质了。
+          var nowMs = Date.now();
+          W.__dypc4kBackoff = W.__dypc4kBackoff || {};
+          var boUntil = W.__dypc4kBackoff[vkey] || 0;
           reverts[vkey] = (reverts[vkey] || 0) + 1;
-          if (reverts[vkey] > 5 && reverts[vkey + 'hard'] <= 3) {
-            reverts[vkey + 'hard'] = (reverts[vkey + 'hard'] || 0) + 1;
-            post('giveup', 'cur=' + cur + ' eff=' + effDef + ' real=' + realW + 'x' + realH + ' retry#' + reverts[vkey + 'hard']);
+          if (reverts[vkey] > 4) {
+            if (nowMs < boUntil) return;                 // 还在退避期，这一轮不动它
+            W.__dypc4kBackoff[vkey] = nowMs + 4000;       // 【v1.6】15s 太久，feed 里早就划过去了
+            reverts[vkey] = 1;
+            post('giveup', 'backoff 4s cur=' + cur + ' eff=' + effDef + ' real=' + realW + 'x' + realH);
           }
-          if (reverts[vkey] > 5) return;
           post('revert', 'cur=' + cur + ' -> ' + effDef + (effDef === Number(CFG.gear) ? ' (4K)' : ' (该视频最高)') +
                ' real=' + realW + 'x' + realH + ' want>=' + wantShort + ' #' + reverts[vkey]);
           if (!forceChange(p, effTgt, effDef)) {
             try { p.changeDefinition(effTgt, p.curDefinition); } catch (e) { post('err', 'changeDefinition: ' + e.message); }
           }
-        });
+        }
         var sig = JSON.stringify(dump.map(function (d) { return [d.playing, d.cur, d.auto, d.gears]; }));
         if (sig !== lastSig) { lastSig = sig; post('state', JSON.stringify(dump)); }
       }
@@ -1340,18 +1902,19 @@
         }
         if (ps.length || bootTries >= 40) {
           post('ok', 'players=' + ps.length);
-          setInterval(step, 800);
+          setInterval(step, CFG.safePlayback ? 2500 : 800);
           step();
-          // 视频一开播就立刻补一次（__dypc4kFastStep），把"先 540 后 4K"的窗口压到最小
-          try {
-            var fast = function () { setTimeout(step, 30); setTimeout(step, 200); setTimeout(step, 600); };
-            document.addEventListener('playing', fast, true);
-            document.addEventListener('loadedmetadata', fast, true);
-            document.addEventListener('canplay', fast, true);
-          } catch (e) {}
+          if (!CFG.safePlayback) {
+            try {
+              var fast = function () { setTimeout(step, 30); setTimeout(step, 200); setTimeout(step, 600); };
+              document.addEventListener('playing', fast, true);
+              document.addEventListener('loadedmetadata', fast, true);
+              document.addEventListener('canplay', fast, true);
+            } catch (e) {}
+          }
           return;
         }
-        setTimeout(boot, 500);
+        setTimeout(boot, CFG.safePlayback ? 1000 : 500);
       }
       boot();
 
@@ -1360,6 +1923,15 @@
       // 这里执行完通过 postMessage 把结果回传，preload 再落盘。
       try {
         var ACT = {};
+        // 通用调试入口：把命令行的剩余部分当 JS 执行（只用于诊断）
+        ACT.eval = function () {
+          if (CFG.safePlayback) return 'disabled: safe playback mode';
+          var code = [].slice.call(arguments).join(' ');
+          try {
+            var r = (0, eval)(code);
+            return (r === undefined) ? 'undefined' : String(r);
+          } catch (e) { return 'ERR ' + (e && e.message); }
+        };
         ACT.state = function () {
           return JSON.stringify(allPlayers().map(function (p, _k) {
             var v = p.video || p.media || {};
@@ -1370,6 +1942,126 @@
               rs: v.readyState, src: String(v.src || '').slice(0, 40)
             };
           }));
+        };
+        var observedMedia = new WeakMap(), nextMediaId = 0;
+        ACT.observe = function () {
+          var ps = allPlayers(), videos = [].slice.call(document.querySelectorAll('video'));
+          var active = -1, largest = 0;
+          var samples = videos.map(function (v, index) {
+            var id = observedMedia.get(v);
+            if (!id) { id = ++nextMediaId; observedMedia.set(v, id); }
+            var r = v.getBoundingClientRect(), w = W.innerWidth || 0, h = W.innerHeight || 0;
+            var area = Math.max(0, Math.min(r.right, w) - Math.max(r.left, 0)) *
+              Math.max(0, Math.min(r.bottom, h) - Math.max(r.top, 0));
+            if (area > largest) { largest = area; active = index; }
+            var p = null;
+            for (var i = 0; i < ps.length; i++) if (ps[i].video === v || ps[i].media === v) { p = ps[i]; break; }
+            var c = p && p.config || {}, a = c.awemeInfo || {}, ranges = [], ahead = 0;
+            var time = v.currentTime || 0;
+            try {
+              for (var b = 0; b < v.buffered.length; b++) {
+                var start = v.buffered.start(b), end = v.buffered.end(b);
+                ranges.push([start, end]);
+                if (start <= time + 0.1 && end >= time) ahead = Math.max(ahead, end - time);
+              }
+            } catch (e) {}
+            var quality = null;
+            try { quality = v.getVideoPlaybackQuality && v.getVideoPlaybackQuality(); } catch (e) {}
+            var src = String(v.currentSrc || v.src || '');
+            var live = !!v.srcObject || !!c.isLive;
+            var list = defList(p || {}) || [];
+            return {
+              id: id, visible: area > 0, area: Math.round(area), top: Math.round(r.top),
+              width: v.videoWidth || 0, height: v.videoHeight || 0, time: time,
+              duration: isFinite(v.duration) ? v.duration : null, paused: !!v.paused,
+              readyState: v.readyState, networkState: v.networkState, live: live,
+              source: /^blob:/.test(src) ? 'blob' : /^https?:/.test(src) ? 'http' : src ? 'other' : 'none',
+              sourceKey: src, aid: String(a.aweme_id || a.awemeId || c.aweme_id || c.awemeId || ''),
+              uri: String(c.uri || c.vid || ''), definition: p ? curDef(p) : null,
+              auto: c.needAutoBitrate, autoOptions: c.autoBitrateOpts || null,
+              buffer: ranges, ahead: ahead, frames: quality ? quality.totalVideoFrames : null,
+              dropped: quality ? quality.droppedVideoFrames : null,
+              error: v.error ? { code: v.error.code, message: v.error.message } : null,
+              gears: list.map(function (g) { return { definition: g.definition, width: g.width, height: g.height, name: g.gearName }; })
+            };
+          });
+          return JSON.stringify({ at: Date.now(), href: String(location.href), visibility: document.visibilityState,
+            safePlayback: !!CFG.safePlayback, qualityAbPatch: !!CFG.qualityAbPatch,
+            preferHighHevc: !!CFG.preferHighHevc, hevcInit: W.__dypc4kHevcInit || null,
+            qualityAB: W.__dypc4kQualityAB || null, active: active, videos: samples });
+        };
+        ACT.inspectquality = function () {
+          var ps = allPlayers(), chosen = null, largest = 0;
+          ps.forEach(function (p) {
+            var m = p.video || p.media;
+            if (!m || typeof m.getBoundingClientRect !== 'function') return;
+            var r = m.getBoundingClientRect();
+            var area = Math.max(0, Math.min(r.right, W.innerWidth) - Math.max(r.left, 0)) *
+              Math.max(0, Math.min(r.bottom, W.innerHeight) - Math.max(r.top, 0));
+            if (area > largest) { largest = area; chosen = p; }
+          });
+          if (!chosen) return JSON.stringify({ error: 'no visible player' });
+          var c = chosen.config || {}, a = c.awemeInfo || {}, list = defList(chosen) || [];
+          var aid = String(a.aweme_id || a.awemeId || c.aweme_id || c.awemeId || '');
+          var m = chosen.video || chosen.media;
+          var methods = {}, proto = chosen, seen = {};
+          for (var depth = 0; proto && depth < 5; depth++, proto = Object.getPrototypeOf(proto)) {
+            Object.getOwnPropertyNames(proto).forEach(function (key) {
+              if (seen[key] || !/switch|definition|abr|clarity|player|dash/i.test(key)) return;
+              seen[key] = 1;
+              try { methods[key] = typeof chosen[key] === 'function' ? String(chosen[key]).slice(0, 2400) : Object.prototype.toString.call(chosen[key]); } catch (e) {}
+            });
+          }
+          var plugins = {};
+          ['dashplugin', 'mp4encryptplayer', 'bitrateselector'].forEach(function (name) {
+            var plugin = chosen.plugins && chosen.plugins[name];
+            if (!plugin) return;
+            var result = { keys: Object.keys(plugin).slice(0, 70), methods: {} };
+            ['changeDefinition', 'abrSwitchURL', 'func', 'switchURL', 'seamlessSwitch'].forEach(function (key) {
+              if (typeof plugin[key] === 'function') result.methods[key] = String(plugin[key]).slice(0, key === 'changeDefinition' ? 12000 : 4500);
+            });
+            if (name === 'mp4encryptplayer') {
+              result.ownerPlayer = plugin.player === chosen;
+              result.ownerMedia = !!(plugin.player && (plugin.player.video === m || plugin.player.media === m));
+              result.ownerAid = String((((plugin.player || {}).config || {}).awemeInfo || {}).aweme_id || '');
+              result.state = { isInit: !!plugin._isInit, isMseInit: !!plugin._isMseInit,
+                useVideoLoad: !!plugin.useVideoLoad, switchBitRateWay: !!plugin._switchBitRateWay,
+                hasMp4: !!plugin.mp4, hasMse: !!plugin.mse, mseError: !!plugin._MSEError,
+                hasAbr: !!plugin._abrService, abrEnabled: plugin._abrService ? plugin._abrService.enabled : null,
+                playerMethodIsPlugin: chosen.changeDefinition === plugin.changeDefinition,
+                handlerUrl: typeof plugin._handlerUrl === 'function' ? String(plugin._handlerUrl).slice(0, 1800) : null,
+                pluginMethod: typeof plugin.changeDefinition === 'function' ? String(plugin.changeDefinition).slice(0, 1800) : null };
+            }
+            plugins[name] = result;
+          });
+          var bs = (c.BitrateSelector && typeof c.BitrateSelector === 'object') ? c.BitrateSelector : {};
+          var fix = bs.fix_concat && typeof bs.fix_concat === 'object' ? bs.fix_concat : {};
+          var runtime = { platform: String((navigator && navigator.platform) || ''),
+            hardwareConcurrency: Number(navigator && navigator.hardwareConcurrency) || 0,
+            codecType: String(c.codecType || ''), userSelectDefinition: c.userSelectDefinition,
+            protocol: String((c.baseConfig && c.baseConfig.protocol) || ''), bitrateSelectorMode: String(bs.mode || ''),
+            fixH2662k4k: fix.fix_h266_2k4k_mode, disableBitrateFilter: !!c.disableBitrateFilter };
+          var captured = (AID2GEARS[aid] || []).map(function (r) {
+            var g = r.g || {}, pa = g.play_addr || {};
+            return { def: r.def, width: pa.width, height: pa.height, uri: pa.uri, name: g.gear_name,
+              codec: g.is_h265, format: g.format, bitrate: g.bit_rate, size: pa.data_size,
+              fileId: g.file_id || g.fileId || pa.file_id || '', pktOffsetMap: !!g.pkt_offset_map,
+              indexRange: g.index_range || g.indexRange || null, initRange: g.init_range || g.initRange || null,
+              firstSegmentRange: g.first_segment_range || g.firstSegmentRange || null,
+              audioFileId: g.audio_file_id || g.audioFileId || '', videoExtra: g.video_extra || null,
+              urlCount: (pa.url_list || []).length,
+              playAddrKeys: Object.keys(pa), gearKeys: Object.keys(g),
+              firstUrl: String((pa.url_list || [])[0] || '').slice(0, 100) };
+          });
+          return JSON.stringify({ aid: aid, uri: String(c.uri || c.vid || ''), live: !!m.srcObject || !!c.isLive,
+            mediaMatch: chosen.video === m || chosen.media === m,
+            width: m.videoWidth, height: m.videoHeight, time: m.currentTime, readyState: m.readyState,
+            networkState: m.networkState, paused: !!m.paused, source: String(m.currentSrc || m.src || ''),
+            runtime: runtime, configKeys: Object.keys(c), playerKeys: Object.keys(chosen).slice(0, 120), methods: methods, plugins: plugins,
+            gears: list.map(function (g) { return { def: g.definition, width: g.width, height: g.height, uri: g.uri,
+              h265: g.isH265, h266: g.isH266, name: g.gearName, codec: g.codecType, format: g.format,
+              urlType: Object.prototype.toString.call(g.url), firstUrl: pickUrl(g.url).slice(0, 90) }; }),
+            captured: captured });
         };
         ACT.diag = function () { diag2(); return 'diag2 queued'; };
         ACT.gears = function () {
@@ -1431,17 +2123,40 @@
           return out.join(' || ');
         };
         ACT.scroll = function (dy) {
+          var d = Number(dy) || 800;
+          var tried = [];
+          // a) 从屏幕中心往上找 overflow 容器（原来的做法）
           var e = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
           var n = 0;
-          while (e && n < 12) {
+          while (e && n < 16) {
             var st = window.getComputedStyle(e);
-            if (/(auto|scroll)/.test(st.overflowY)) {
-              e.scrollTop += Number(dy) || 800;
-              return 'scrolled ' + e.tagName + '.' + String(e.className).slice(0, 30) + ' -> ' + Math.round(e.scrollTop);
+            if (/(auto|scroll)/.test(st.overflowY) && e.scrollHeight > e.clientHeight + 50) {
+              var before = e.scrollTop;
+              e.scrollTop += d;
+              if (e.scrollTop !== before) return 'scroller ' + e.tagName + '.' + String(e.className).slice(0, 24) + ' ' + Math.round(before) + '->' + Math.round(e.scrollTop);
+              tried.push(e.tagName + '.' + String(e.className).slice(0, 18));
             }
             e = e.parentElement; n++;
           }
-          return 'no scroll container';
+          // b) 全文档找出所有可滚动且内容超高的元素，挑最高的那个
+          var cands = [].slice.call(document.querySelectorAll('*')).filter(function (x) {
+            if (x.scrollHeight <= x.clientHeight + 50) return false;
+            var s = window.getComputedStyle(x);
+            return /(auto|scroll)/.test(s.overflowY) && x.clientHeight > 200;
+          });
+          if (cands.length) {
+            cands.sort(function (a, b) { return b.scrollHeight - a.scrollHeight; });
+            var t = cands[0], b0 = t.scrollTop;
+            t.scrollTop += d;
+            return 'scrollTop ' + t.tagName + '.' + String(t.className).slice(0, 24) + ' ' + Math.round(b0) + '->' + Math.round(t.scrollTop);
+          }
+          // c) 都没有：对 window 滚 + 给 <video> 派 wheel
+          window.scrollBy(0, d);
+          var v = document.querySelector('video');
+          if (v) {
+            v.dispatchEvent(new WheelEvent('wheel', { deltaY: d, deltaMode: 0, bubbles: true, cancelable: true }));
+          }
+          return 'fallback window.scrollBy + wheel on video (tried=' + tried.join(',') + ')';
         };
         ACT.plugins = function () {
           var out = allPlayers().map(function (p) {
@@ -1606,7 +2321,99 @@
           return 'found; fns=' + ms.slice(0, 40).join(',') +
             ' cur=' + JSON.stringify((s.curDefinition && s.curDefinition.definition) || null);
         };
+        ACT.spowner = function () {
+          var vs = [].slice.call(document.querySelectorAll('video')), media = null, best = 0;
+          vs.forEach(function (v) {
+            var r = v.getBoundingClientRect();
+            var area = Math.max(0, Math.min(r.right, W.innerWidth) - Math.max(r.left, 0)) *
+              Math.max(0, Math.min(r.bottom, W.innerHeight) - Math.max(r.top, 0));
+            if (area > best) { best = area; media = v; }
+          });
+          if (!media) return JSON.stringify({ error: 'no visible media' });
+          var ps = allPlayers(), player = null;
+          for (var pi = 0; pi < ps.length; pi++) if (ps[pi].video === media || ps[pi].media === media) { player = ps[pi]; break; }
+          if (!player) return JSON.stringify({ error: 'no exact player-media owner', area: best });
+          var fibers = [], keys = [], domOwners = [];
+          for (var de = media, dd = 0; de && dd < 18; de = de.parentElement, dd++) {
+            var dkeys = [];
+            try { dkeys = Object.keys(de).filter(function (k) { return k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0; }); } catch (e) {}
+            dkeys.forEach(function (k) { try { if (de[k]) { fibers.push(de[k]); domOwners.push({ key: k, tag: de.tagName, cls: String(de.className || '').slice(0, 70), depth: dd }); keys.push(k); } } catch (e) {} });
+          }
+          var rows = [], wrappers = [], seen = [], seenObjects = [];
+          while (fibers.length && rows.length < 120) {
+            var f = fibers.shift();
+            if (!f || seen.indexOf(f) >= 0) continue;
+            seen.push(f);
+            var chain = f, host = null, up = 0;
+            while (chain && up++ < 60) {
+              if (chain.stateNode && chain.stateNode.nodeType === 1) { host = chain.stateNode; if (host === media || (host.contains && host.contains(media))) break; }
+              chain = chain.return;
+            }
+            var props = [f.memoizedProps, f.pendingProps, f.stateNode, f.memoizedState], direct = [];
+            function recordCandidate(obj, path) {
+              if (!obj || (typeof obj !== 'object' && typeof obj !== 'function') || seen.indexOf(obj) >= 0) return;
+              var refs = [];
+              ['player','video','media','current','playerInstance','xgplayer','playerRef'].forEach(function (key) {
+                try { if (obj[key] === media) refs.push(key + '=media'); else if (obj[key] === player) refs.push(key + '=player'); } catch (e) {}
+              });
+              if (typeof obj.seamlessSwitch === 'function') {
+                var id = '', uri = '';
+                try { id = String((((obj.awemeInfo || obj.config || {}).aweme_id) || obj.awemeId || '')); } catch (e) {}
+                try { uri = String(obj.uri || obj.vid || ''); } catch (e) {}
+                wrappers.push({ path: path, fiberTag: f.tag, fiberType: String(f.type && (f.type.displayName || f.type.name || f.type) || '').slice(0, 80),
+                  ownerHost: !!(host && (host === media || (host.contains && host.contains(media)))),
+                  directRefs: refs, aid: id, uri: uri, keys: Object.keys(obj).slice(0, 45),
+                  cur: obj.curDefinition && obj.curDefinition.definition });
+              } else if (refs.length) direct.push({ path: path, refs: refs, keys: Object.keys(obj).slice(0, 30) });
+            }
+            props.forEach(function (o, oi) {
+              recordCandidate(o, 'fiber[' + oi + ']');
+              if (!o || (typeof o !== 'object' && typeof o !== 'function')) return;
+              var ks; try { ks = Object.keys(o).slice(0, 80); } catch (e) { ks = []; }
+              ks.forEach(function (k) { try { recordCandidate(o[k], 'fiber[' + oi + '].' + k); } catch (e) {} });
+            });
+            rows.push({ tag: f.tag, type: String(f.type && (f.type.displayName || f.type.name || f.type) || '').slice(0, 80),
+              hostTag: host && host.tagName, hostClass: host && String(host.className || '').slice(0, 80),
+              hostContainsMedia: !!(host && (host === media || (host.contains && host.contains(media)))), refs: direct });
+            if (f.return) fibers.push(f.return);
+          }
+          var r = media.getBoundingClientRect(), cfg = player.config || {}, a = cfg.awemeInfo || {};
+          var mp = player.plugins && player.plugins.mp4encryptplayer;
+          return JSON.stringify({ visible: { aid: String(a.aweme_id || a.awemeId || ''), uri: String(cfg.uri || cfg.vid || ''),
+            area: Math.round(best), rect: { x: Math.round(r.left), y: Math.round(r.top), w: Math.round(r.width), h: Math.round(r.height) },
+            live: !!media.srcObject || !!cfg.isLive, srcObject: !!media.srcObject, source: String(media.currentSrc || media.src || ''),
+            dimensions: [media.videoWidth || 0, media.videoHeight || 0], readyState: media.readyState, time: media.currentTime },
+            exactPlayer: { found: true, sameMedia: player.video === media || player.media === media,
+              mp4OwnerPlayer: !!mp && mp.player === player, mp4OwnerMedia: !!mp && !!mp.player && (mp.player.video === media || mp.player.media === media),
+              mp4Init: !!mp && !!mp._isInit, mp4MseInit: !!mp && !!mp._isMseInit, mp4Error: !!mp && !!mp._MSEError,
+              cfgCodec: cfg.codecType, selectorMode: cfg.BitrateSelector && cfg.BitrateSelector.mode,
+              hwThreads: navigator.hardwareConcurrency || 0, platform: navigator.platform || '',
+              highDefs: (defList(player) || []).map(function (e) { return { def: e.definition, w: e.width, h: e.height, name: e.gearName, uri: e.uri, h265: e.isH265, h266: e.isH266 }; }) },
+            reactKeys: keys, fibers: rows, seamlessWrappersOnVideoAncestry: wrappers,
+            cachedGlobalWrapper: (function () {
+              var s = findSeamless();
+              if (!s) return null;
+              function shallow(o) {
+                if (!o || (typeof o !== 'object' && typeof o !== 'function')) return null;
+                var refs = [], keys = Object.keys(o).slice(0, 80);
+                keys.forEach(function (k) { try { if (o[k] === media) refs.push(k + '=media'); else if (o[k] === player) refs.push(k + '=player'); } catch (e) {} });
+                var c = o.config || o._config || {};
+                return { keys: keys.slice(0, 55), refs: refs, aid: String((c.awemeInfo && c.awemeInfo.aweme_id) || c.aweme_id || o.awemeId || ''),
+                  uri: String(c.uri || c.vid || o.uri || o.vid || ''), codec: c.codecType || '',
+                  videoEq: o.video === media, mediaEq: o.media === media, privateVideoEq: o._video === media,
+                  playerEq: o.player === player, cur: o.curDefinition && o.curDefinition.definition,
+                  cfgKeys: Object.keys(c).slice(0, 60) };
+              }
+              var protoFns = [], proto = s, depth = 0, seenFn = {};
+              while (proto && depth++ < 5) { try { Object.getOwnPropertyNames(proto).forEach(function (k) { try { if (!seenFn[k] && typeof s[k] === 'function') { seenFn[k] = 1; if (/seamless|switch|player|video|config/i.test(k)) protoFns.push(k); } } catch (e) {} }); proto = Object.getPrototypeOf(proto); } catch (e) { break; } }
+              return { direct: shallow(s), core: shallow(s._core), plugins: shallow(s._plugins), video: shallow(s._video),
+                seamlessFunction: String(s.seamlessSwitch).slice(0, 2400), protoFns: protoFns,
+                has: { seamless: typeof s.seamlessSwitch === 'function', updateConfig: typeof s.updateConfig === 'function',
+                  emit: typeof s.emit === 'function', dispatchEvent: typeof s.dispatchEvent === 'function' } };
+            })() });
+        };
         ACT.spsw = function (d) {
+          if (CFG.safePlayback) return 'disabled: safe playback mode';
           var s = findSeamless();
           if (!s) return 'no seamless wrapper';
           var pl = allPlayers()[0];
@@ -1645,6 +2452,7 @@
           return null;
         }
         ACT.hard = function (d) {
+          if (CFG.safePlayback) return 'disabled: safe playback mode';
           var p = mainPlayer();
           if (!p) return 'no player';
           var e = entryFor(p, d);
@@ -1678,6 +2486,7 @@
         };
         // 用接口档位直接硬换源（不等 fillMissing、也不管播放器是 MSE 还是渐进式）
         ACT.hard4k = function (want) {
+          if (CFG.safePlayback) return 'disabled: safe playback mode';
           var p = mainPlayer();
           if (!p) return 'no player';
           var m = p.media || p.video;
@@ -1711,7 +2520,7 @@
           var before = (m.videoWidth || 0) + 'x' + (m.videoHeight || 0);
           var keep = m.currentTime, wasMSE = /^blob/.test(m.currentSrc || m.src);
           try { m.pause(); } catch (er) {}
-          // 关键：<source> 子元素存在时浏览器忽略 media.src，先清掉
+          // 旧版硬换源流程；安全播放模式已在入口停用。
           try {
             var kids = m.querySelectorAll('source');
             for (var s = 0; s < kids.length; s++) kids[s].parentNode.removeChild(kids[s]);
@@ -1834,6 +2643,7 @@
           return 'no playing player';
         };
         ACT.force = function (d) {
+          if (CFG.safePlayback) return 'disabled: safe playback mode';
           var done = 0;
           allPlayers().forEach(function (p) {
             try {
@@ -1866,7 +2676,7 @@
     try {
       var electron = require('electron');
       var lockSrc = '(' + LOCK_FN.toString() + ')(' +
-        JSON.stringify({ gear: p.gearType, clarity: p.gearClarity, fight: !!FIGHT, codec: LOCK_CODEC, refuse: REFUSE, abPatch: !!AB_PATCH }) + ');';
+        JSON.stringify({ gear: p.gearType, clarity: p.gearClarity, fight: !!FIGHT, codec: LOCK_CODEC, refuse: REFUSE, abPatch: !!AB_PATCH, qualityAbPatch: !!QUALITY_AB_PATCH, preferHighHevc: !!PREFER_HIGH_HEVC, safePlayback: !!SAFE_PLAYBACK, captureGears: !!CAPTURE_GEARS }) + ');';
       electron.webFrame.executeJavaScript(lockSrc).catch(function () {});
     } catch (e) {}
 
@@ -1914,10 +2724,14 @@
       }
 
       function activeVideo() {
-        var vs = [].slice.call(document.querySelectorAll('video'));
-        for (var i = 0; i < vs.length; i++) if (!vs[i].paused && vs[i].videoWidth) return vs[i];
-        for (var j = 0; j < vs.length; j++) if (vs[j].videoWidth) return vs[j];
-        return vs[0] || null;
+        var vs = [].slice.call(document.querySelectorAll('video')), best = null, bestArea = 0;
+        for (var i = 0; i < vs.length; i++) {
+          var r = vs[i].getBoundingClientRect();
+          var area = Math.max(0, Math.min(r.right, W.innerWidth) - Math.max(r.left, 0)) *
+            Math.max(0, Math.min(r.bottom, W.innerHeight) - Math.max(r.top, 0));
+          if (area > bestArea) { bestArea = area; best = vs[i]; }
+        }
+        return best;
       }
 
       function fmtRate(bps) {
@@ -1934,7 +2748,10 @@
 
         var v = activeVideo();
         var players = findPlayers();
-        var p = players[0] || null;
+        var p = null;
+        for (var pi = 0; pi < players.length; pi++) {
+          if (players[pi].video === v || players[pi].media === v) { p = players[pi]; break; }
+        }
         var cur = p && p.curDefinition ? p.curDefinition : null;
 
         if (v) {
@@ -2073,12 +2890,12 @@
         var info = collect();
         var v = activeVideo();
         var players = findPlayers();
-        var p = players[0] || null;
+        var p = null;
         if (v) {
           for (var i = 0; i < players.length; i++) {
             var pp = players[i];
             try {
-              if (pp.video === v || (pp.root && pp.root.contains && pp.root.contains(v))) { p = pp; break; }
+              if (pp.video === v || pp.media === v) { p = pp; break; }
             } catch (e) {}
           }
           watchFps(v);

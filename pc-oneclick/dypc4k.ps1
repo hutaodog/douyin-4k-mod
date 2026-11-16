@@ -4,7 +4,11 @@
   =====================================================================
   给不装 Node、不会敲命令的人用的：双击「一键开启4K.cmd」即可。
   原理：把一段注入脚本追加到客户端的 preload.js 末尾（preload 在页面脚本之前执行），
-        每帧先把清晰度写成「超清 4K」，并改写服务端 AB 配置里的自动降档开关。
+        每 400ms 维持「超清 4K」手选偏好；在同一 aweme、同一 URI 的原始数据进入播放器前，
+        仅当本机 CPU>=8、MediaSource 支持 hev1.1.6.L93.B0，且有效非直播 SDR MP4 HEVC
+        最大短边>1080、高于 VVC 最大短边并有直链时，移除较低的 numeric2 VVC 候选，
+        优选原有高分辨率 HEVC 起播；保留原 HEVC/AVC 行、顺序、URL、元数据及低码率档。
+        不改写 AB、不改能力；保留原生 ABR/卡顿恢复，轮询不操作媒体、换源或播放进度。
 
   用法：
     双击 一键开启4K.cmd        按默认（4K）安装
@@ -245,8 +249,11 @@ $snip = [System.IO.File]::ReadAllText($Snippet, [System.Text.Encoding]::UTF8)
 $snip = $snip -replace "var TARGET = '[^']+';", "var TARGET = '$Target';"
 $snip = $snip -replace "var FIGHT = (true|false);", 'var FIGHT = false;'
 $snip = $snip -replace "var LOCK_CODEC = '[^']*';", "var LOCK_CODEC = '';"
-$snip = $snip -replace "var REFUSE = '[^']*';", "var REFUSE = 'vvc';"
-$snip = $snip -replace "var AB_PATCH = (true|false);", 'var AB_PATCH = true;'
+$snip = $snip -replace "var REFUSE = '[^']*';", "var REFUSE = 'none';"
+$snip = $snip -replace "var AB_PATCH = (true|false);", 'var AB_PATCH = false;'
+$snip = $snip -replace "var QUALITY_AB_PATCH = (true|false);", 'var QUALITY_AB_PATCH = false;'
+$snip = $snip -replace "var PREFER_HIGH_HEVC = (true|false);", 'var PREFER_HIGH_HEVC = true;'
+$snip = $snip -replace "var SAFE_PLAYBACK = (true|false);", 'var SAFE_PLAYBACK = true;'
 
 $new = $content.TrimEnd() + "`r`n`r`n" + $snip + "`r`n"
 try {
@@ -272,12 +279,14 @@ Say '  安装完成 ✔' 'Green'
 Say ''
 Say '  接下来：' 'White'
 Say '    1) 启动抖音 PC 客户端；'
-Say '    2) 随便点开一个视频，右上角清晰度应显示「超清 4K」；'
+Say '    2) 打开推荐页播放视频；Alt+I 可查看真实分辨率和缓冲余量；'
 Say '    3) 如果想还原：双击同目录下的「恢复原版.cmd」。'
 Say ''
 Say '  说明：' 'DarkGray'
-Say '    · 视频本身没有 4K 源时仍会显示较低档位（这是正常的，不是补丁失效）；' 
-Say '    · 客户端自动更新后如果 4K 消失，重新双击「一键开启4K.cmd」即可；'
+Say '    · 同视频 H.265 档位更高且本机支持时，起播前优选高画质编码组；'
+Say '    · 保留低码率档和原生卡顿恢复，不再后台硬换源或重置缓冲；'
+Say '    · 实际画质受视频源、客户端和网络影响；Alt+I 查看真实解码分辨率；'
+Say '    · 客户端自动更新覆盖补丁后，重新双击「一键开启4K.cmd」即可；'
 Say '    · 补丁只作用于本机的抖音客户端，不改系统、不联网。'
 Say ''
 
